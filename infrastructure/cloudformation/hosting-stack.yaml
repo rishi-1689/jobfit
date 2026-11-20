@@ -1,0 +1,207 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >
+  JobFit Copilot - Phase 1 - Static hosting stack.
+  A private S3 bucket holds the built React app; a CloudFront distribution
+  serves it worldwide over HTTPS. CloudFront reaches the bucket through an
+  Origin Access Control (OAC), so the bucket itself never needs to be public.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: jobfit-copilot
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+
+Resources:
+  # -------------------------------------------------------------------------
+  # AWS::S3::Bucket  (the origin)
+  #
+  # This bucket stores the compiled frontend: index.html, JS/CSS bundles,
+  # images. A quick note on "static website hosting": S3 has a feature by
+  # that name, but its website endpoint REQUIRES public read access and only
+  # speaks plain HTTP. Since we want the bucket fully private and HTTPS-only,
+  # we do NOT enable that feature. Instead we keep the bucket as a normal
+  # private bucket and let CloudFront do the "website" part (default root
+  # object, HTTPS, SPA routing). CloudFront reads objects via the bucket's
+  # regular REST endpoint, authenticated by OAC.
+  # -------------------------------------------------------------------------
+  SiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      # Bucket names are globally unique; the account ID suffix avoids clashes.
+      BucketName: !Sub "${ProjectName}-${Environment}-site-${AWS::AccountId}"
+
+      # Turn OFF every route to public access. Even if a policy or ACL later
+      # tries to grant "everyone" read, S3 will ignore it. Access is only
+      # possible through the CloudFront principal we allow in the bucket
+      # policy below.
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+      # Keep old versions of files so a bad deploy can be rolled back.
+      VersioningConfiguration:
+        Status: Enabled
+
+      # Versioning on its own keeps every prior version FOREVER - every
+      # deploy-frontend.sh run overwrites index.html/JS/CSS, and each
+      # previous copy becomes a "noncurrent" version that otherwise sticks
+      # around, quietly costing more each time. This expires a noncurrent
+      # version 30 days after it stops being current, which is a generous
+      # rollback window for a project deployed this often. (No matching
+      # rule is needed on the uploads bucket in storage-stack.yaml - that
+      # one isn't versioned, it just expires whole objects after 90 days.)
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireNoncurrentVersionsAfter30Days
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # -------------------------------------------------------------------------
+  # AWS::CloudFront::OriginAccessControl (OAC)
+  #
+  # An Origin Access Control is CloudFront's identity for talking to a
+  # private origin. When CloudFront fetches a file from S3, it signs that
+  # request with SigV4 as the CloudFront service principal. The S3 bucket
+  # policy (below) trusts exactly that signature + this distribution's ARN,
+  # so only CloudFront can read the bucket - never the public internet.
+  #
+  # OAC is the current AWS-recommended mechanism. It replaces the older
+  # "Origin Access Identity" (OAI); OAC adds SigV4, works in all regions,
+  # and supports SSE-KMS. "SigningBehavior: always" means every request to
+  # the origin is signed.
+  # -------------------------------------------------------------------------
+  OriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${ProjectName}-${Environment}-oac"
+        Description: OAC so CloudFront can read the private site bucket.
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # -------------------------------------------------------------------------
+  # AWS::CloudFront::Distribution  (the CDN / public front door)
+  #
+  # CloudFront is a content delivery network: ~600 edge locations cache your
+  # files close to users, terminate HTTPS, and forward cache misses to the
+  # origin. For this app it also does three "web server" jobs:
+  #   1. DefaultRootObject: serve index.html when the path is "/".
+  #   2. ViewerProtocolPolicy: force HTTP -> HTTPS.
+  #   3. CustomErrorResponses: rewrite 403/404 to index.html so client-side
+  #      routes like /dashboard work on refresh (single-page-app routing).
+  # -------------------------------------------------------------------------
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub "${ProjectName} ${Environment} SPA"
+        DefaultRootObject: index.html
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        # PriceClass_100 = North America + Europe edges only (cheapest).
+        PriceClass: PriceClass_100
+
+        Origins:
+          - Id: s3-site-origin
+            # RegionalDomainName is the REST endpoint
+            # (bucket.s3.<region>.amazonaws.com), which supports OAC/SigV4.
+            # Do NOT use the *website* endpoint here.
+            DomainName: !GetAtt SiteBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt OriginAccessControl.Id
+            # S3OriginConfig with an empty OriginAccessIdentity tells
+            # CloudFront "this is an S3 origin, and I'm using OAC not OAI".
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+
+        DefaultCacheBehavior:
+          TargetOriginId: s3-site-origin
+          ViewerProtocolPolicy: redirect-to-https
+          Compress: true
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          CachedMethods: [GET, HEAD]
+          # AWS-managed "CachingOptimized" policy: respects origin
+          # Cache-Control headers, gzip/brotli, no cookies/query in cache key.
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+
+        # SPA routing: when a user hits /dashboard directly, S3 has no such
+        # object and returns 403 (with OAC) or 404. Serve index.html with a
+        # 200 instead and let React Router take over.
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 10
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 10
+
+        # Use the default *.cloudfront.net certificate. Phase 1 has no custom
+        # domain; add an ACM cert + Aliases here when you get one.
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+
+  # -------------------------------------------------------------------------
+  # AWS::S3::BucketPolicy
+  #
+  # This is the other half of OAC. It grants s3:GetObject to the CloudFront
+  # service principal, but ONLY when the request comes from this specific
+  # distribution (AWS:SourceArn condition). Nothing else - not your IAM
+  # user, not the public - can read objects.
+  # -------------------------------------------------------------------------
+  SiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SiteBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFrontServicePrincipalReadOnly
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "${SiteBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${Distribution.Id}"
+
+Outputs:
+  SiteBucketName:
+    Description: Bucket the deploy script syncs the build output into.
+    Value: !Ref SiteBucket
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-SiteBucketName"
+
+  DistributionId:
+    Description: Distribution ID the deploy script invalidates.
+    Value: !Ref Distribution
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-DistributionId"
+
+  CloudFrontDomainName:
+    Description: Public URL of the app (https://<this value>).
+    Value: !GetAtt Distribution.DomainName
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-CloudFrontDomainName"

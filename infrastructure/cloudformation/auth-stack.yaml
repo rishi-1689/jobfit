@@ -1,0 +1,328 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >
+  JobFit Copilot - Phase 1 - Authentication stack.
+  Provisions a Cognito User Pool (the user directory) and a public-SPA
+  User Pool Client so the React frontend can register, verify, and sign in
+  users with email + password.
+
+# ---------------------------------------------------------------------------
+# Parameters let you deploy the same template into multiple environments
+# (dev / staging / prod) without editing the file. CloudFormation prompts
+# for these at deploy time, or you pass them with --parameter-overrides.
+# ---------------------------------------------------------------------------
+Parameters:
+  ProjectName:
+    Type: String
+    Default: jobfit-copilot
+    Description: Prefix applied to all resource names so they are easy to find.
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment environment; part of every resource name.
+
+  CallbackUrls:
+    Type: CommaDelimitedList
+    Default: "http://localhost:5173,https://d2qcosxdgdec5d.cloudfront.net"
+    Description: >
+      URLs Cognito is allowed to redirect back to after a Hosted UI /
+      federated (Google) sign-in, and after sign-out. Must exactly match
+      what the frontend registers as redirectSignIn/redirectSignOut.
+
+  GoogleClientId:
+    Type: String
+    Default: ""
+    Description: >
+      OAuth 2.0 Client ID from Google Cloud Console. Leave blank to deploy
+      without Google sign-in (the button just won't work until this is set).
+
+  GoogleClientSecret:
+    Type: String
+    Default: ""
+    NoEcho: true
+    Description: >
+      OAuth 2.0 Client secret from Google Cloud Console. NoEcho keeps it out
+      of the CloudFormation console/CLI output and events - it is still
+      visible to anyone with IAM permission to read the stack, same as any
+      other CloudFormation parameter, so treat it as a real secret (pass it
+      as an env var at deploy time, never commit it to a file in this repo).
+
+# ---------------------------------------------------------------------------
+# A Condition lets a resource (or a property value, via Fn::If) exist only
+# when something is true - here, "were real Google credentials supplied?".
+# This keeps the stack deployable with just `deploy-infra.sh` (no Google
+# sign-in) and lets Google sign-in be switched on later without restructuring
+# anything, just by supplying GoogleClientId/GoogleClientSecret.
+# ---------------------------------------------------------------------------
+Conditions:
+  EnableGoogleSignIn: !Not [!Equals [!Ref GoogleClientId, ""]]
+
+Resources:
+  # -------------------------------------------------------------------------
+  # AWS::Cognito::UserPool
+  #
+  # A User Pool is a fully managed user directory. It stores each user's
+  # profile (email, name, password hash), runs the sign-up / sign-in /
+  # forgot-password flows, sends verification emails, and issues JWTs
+  # (ID token, access token, refresh token) once a user authenticates.
+  # Think of it as "the database of users + the login server", managed by AWS.
+  # -------------------------------------------------------------------------
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "${ProjectName}-${Environment}-user-pool"
+
+      # Users log in with their email address rather than a separate username.
+      UsernameAttributes:
+        - email
+
+      # When a user signs up, Cognito automatically sends a verification
+      # code to their email and marks the address unverified until they
+      # enter it. "email" here means the email attribute is auto-verified.
+      AutoVerifiedAttributes:
+        - email
+
+      # Controls the wording of the verification email and whether the user
+      # confirms via a numeric code (SPA-friendly) or a magic link.
+      VerificationMessageTemplate:
+        DefaultEmailOption: CONFIRM_WITH_CODE
+        EmailSubject: "Verify your JobFit Copilot account"
+        EmailMessage: "Your JobFit Copilot verification code is {####}"
+
+      # Password rules enforced by Cognito at sign-up and password reset.
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+
+      # Schema defines which attributes exist on every user profile.
+      # email + name are standard OIDC attributes; marking them Required
+      # forces the frontend to collect them at sign-up. Mutable means the
+      # user can change them later.
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+        - Name: name
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+
+      # If a user forgets their password, allow recovery only through their
+      # verified email (no SMS, so we do not need an SNS spend limit).
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+
+      # Use Cognito's built-in email sender. Fine for a portfolio project;
+      # it is rate-limited (~50/day) and the "from" address is AWS-owned.
+      # Swap to EmailSendingAccount: DEVELOPER + SES for production volume.
+      EmailConfiguration:
+        EmailSendingAccount: COGNITO_DEFAULT
+
+      MfaConfiguration: "OFF"
+
+      # Portfolio project: allow `cloudformation delete-stack` to remove the
+      # pool cleanly. Set to ACTIVE in production to prevent accidental loss
+      # of your entire user base.
+      DeletionProtection: INACTIVE
+
+      UserPoolTags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+
+  # -------------------------------------------------------------------------
+  # AWS::Cognito::UserPoolDomain - the Cognito "Hosted UI" domain.
+  #
+  # Federated sign-in (Google, or any external IdP) fundamentally requires a
+  # redirect hop through a Cognito-hosted endpoint: the browser goes
+  # app -> Cognito -> Google -> back to Cognito -> back to app. Cognito, not
+  # our app, holds the Google client secret and does the code-for-tokens
+  # exchange server-side; this domain is the endpoint that exchange happens
+  # on. Our app still uses its own custom Login/Signup pages for email +
+  # password - only the Google button below hands off to this domain, and
+  # only for the few hundred milliseconds it takes to bounce through it.
+  #
+  # This is a *Cognito-prefix* domain: <Domain>.auth.<region>.amazoncognito.com,
+  # free, no ACM certificate to manage (a custom domain would need one).
+  # -------------------------------------------------------------------------
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Sub "${ProjectName}-${Environment}-${AWS::AccountId}"
+      UserPoolId: !Ref UserPool
+
+  # -------------------------------------------------------------------------
+  # AWS::Cognito::UserPoolIdentityProvider - registers Google as a way to
+  # authenticate into *this* User Pool. Cognito calls Google's OAuth
+  # endpoints using the client_id/client_secret below, then maps whatever
+  # claims Google returns onto our User Pool's attributes: Google's `email`
+  # and `name` claims fill the same `email`/`name` attributes email/password
+  # signups use, so the rest of the app (and every later phase) never has to
+  # know or care whether a given user signed up with a password or Google.
+  #
+  # Mapping `username: sub` ties the federated user to Google's stable,
+  # opaque account ID (not their email, which could change) - Cognito then
+  # stores this user internally as "Google_<sub>".
+  # -------------------------------------------------------------------------
+  GoogleIdentityProvider:
+    Type: AWS::Cognito::UserPoolIdentityProvider
+    Condition: EnableGoogleSignIn
+    Properties:
+      UserPoolId: !Ref UserPool
+      ProviderName: Google
+      ProviderType: Google
+      ProviderDetails:
+        client_id: !Ref GoogleClientId
+        client_secret: !Ref GoogleClientSecret
+        authorize_scopes: "openid email profile"
+      AttributeMapping:
+        email: email
+        name: name
+        username: sub
+
+  # -------------------------------------------------------------------------
+  # AWS::Cognito::UserPoolClient
+  #
+  # A User Pool Client is an application's registration with the pool. It
+  # holds per-app settings: which auth flows are allowed, how long tokens
+  # last, and whether the app gets a client secret.
+  #
+  # A browser SPA cannot keep a secret (all JS is downloadable), so we set
+  # GenerateSecret: false. That is the defining trait of a "public client".
+  # Email/password sign-in authenticates using SRP (Secure Remote Password),
+  # which proves knowledge of the password without sending it or needing a
+  # secret; Google sign-in authenticates via the OAuth "authorization code"
+  # flow (AllowedOAuthFlows: [code]) through the Hosted UI domain above -
+  # two different flows, one client, one set of resulting Cognito tokens.
+  # -------------------------------------------------------------------------
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub "${ProjectName}-${Environment}-spa-client"
+      UserPoolId: !Ref UserPool
+
+      # No client secret -> this is a public client, safe to ship in a SPA.
+      GenerateSecret: false
+
+      # Which authentication methods this client may use.
+      #   USER_SRP_AUTH      - password login via SRP (what Amplify uses)
+      #   REFRESH_TOKEN_AUTH - exchange a refresh token for new tokens
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+
+      # Return a generic "incorrect username or password" instead of
+      # revealing whether an account exists (prevents user enumeration).
+      PreventUserExistenceErrors: ENABLED
+
+      # COGNITO = our own email/password flow. Google only appears here once
+      # real credentials are supplied (see the EnableGoogleSignIn Condition).
+      # !Ref GoogleIdentityProvider (not the literal string "Google") is
+      # deliberate: a Ref inside Fn::If is a real, conditionally-evaluated
+      # dependency - CloudFormation only requires GoogleIdentityProvider to
+      # exist when this branch is actually taken. A static DependsOn can't
+      # do this: it's resolved before any condition is evaluated, so it
+      # fails outright whenever the target resource's own Condition is
+      # false. (Ref on a UserPoolIdentityProvider returns its ProviderName,
+      # i.e. the string "Google" - identical to what we'd have hardcoded.)
+      SupportedIdentityProviders:
+        !If [EnableGoogleSignIn, [COGNITO, !Ref GoogleIdentityProvider], [COGNITO]]
+
+      # OAuth (Hosted UI / federated) settings - required for the Google
+      # button's signInWithRedirect() to work at all, independent of whether
+      # Google itself is currently enabled.
+      AllowedOAuthFlows: [code]
+      AllowedOAuthScopes: [openid, email, profile]
+      AllowedOAuthFlowsUserPoolClient: true
+      CallbackURLs: !Ref CallbackUrls
+      LogoutURLs: !Ref CallbackUrls
+
+      # Token lifetimes. Short access/ID tokens limit the blast radius of a
+      # leaked token; the 30-day refresh token keeps users logged in.
+      AccessTokenValidity: 60
+      IdTokenValidity: 60
+      RefreshTokenValidity: 30
+      TokenValidityUnits:
+        AccessToken: minutes
+        IdToken: minutes
+        RefreshToken: days
+
+      # Attributes the app is allowed to read / write on the user profile.
+      ReadAttributes:
+        - email
+        - email_verified
+        - name
+      WriteAttributes:
+        - email
+        - name
+
+  # -------------------------------------------------------------------------
+  # AWS::Cognito::UserPoolGroup - "Admins".
+  #
+  # Cognito groups are the standard way to attach a role to a user within a
+  # pool. Every access/ID token issued to a member of this group carries a
+  # `cognito:groups` claim listing it - api-stack.yaml's admin Lambda checks
+  # for "Admins" in that claim before doing anything, the same way every
+  # other Lambda already trusts the JWT authorizer's verified `sub` claim.
+  # No API Gateway change is needed for this: HTTP API JWT authorizers only
+  # validate the token itself (signature, expiry, audience) - they can't run
+  # custom logic like "is this user in a group", so that check happens
+  # inside the Lambda, same as any other authorization decision our code
+  # makes (e.g. "does this applicationId belong to this user").
+  #
+  # Membership isn't managed here (a person can't add themselves to an
+  # admin group through infrastructure-as-code without defeating the point)
+  # - see scripts/make-admin.sh for the one-time, out-of-band step.
+  # -------------------------------------------------------------------------
+  AdminsGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      UserPoolId: !Ref UserPool
+      GroupName: Admins
+      Description: Can access /admin - toggle live AI, set the API key, manage per-user quotas.
+
+# ---------------------------------------------------------------------------
+# Outputs are values other stacks / scripts / the frontend need. They show
+# up in `aws cloudformation describe-stacks` and in the console. The Export
+# names make them importable by other CloudFormation stacks in later phases
+# (e.g. an API stack that authorizes requests against this pool).
+# ---------------------------------------------------------------------------
+Outputs:
+  UserPoolId:
+    Description: Cognito User Pool ID (frontend env var VITE_USER_POOL_ID).
+    Value: !Ref UserPool
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-UserPoolId"
+
+  UserPoolClientId:
+    Description: SPA app client ID (frontend env var VITE_USER_POOL_CLIENT_ID).
+    Value: !Ref UserPoolClient
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-UserPoolClientId"
+
+  UserPoolArn:
+    Description: User Pool ARN (used by API Gateway authorizers in later phases).
+    Value: !GetAtt UserPool.Arn
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-UserPoolArn"
+
+  Region:
+    Description: Region the pool lives in (frontend env var VITE_AWS_REGION).
+    Value: !Ref AWS::Region
+
+  UserPoolDomain:
+    Description: >
+      Cognito Hosted UI domain (frontend env var VITE_COGNITO_DOMAIN). This
+      is also the value Google's "Authorized redirect URIs" must include,
+      as https://<this value>/oauth2/idpresponse.
+    Value: !Sub "${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com"
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-UserPoolDomain"

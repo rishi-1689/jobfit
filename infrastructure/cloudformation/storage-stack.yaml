@@ -1,0 +1,218 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >
+  JobFit Copilot - Phase 2 - Storage stack.
+  A private S3 bucket for resume/cover-letter uploads, and two DynamoDB
+  tables: JobApplications (one row per submitted job description) and
+  UserProfiles (one row per user, holding e.g. their current resume key).
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: jobfit-copilot
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+
+Resources:
+  # -------------------------------------------------------------------------
+  # AWS::S3::Bucket - user uploads (resumes now, generated cover letters
+  # later). Same "private bucket" posture as the hosting bucket: nothing is
+  # public. Unlike the hosting bucket, nothing reads this through CloudFront
+  # - the frontend uploads directly to S3 using a presigned URL minted by
+  # the presigned-url Lambda (see api-stack.yaml), and later phases will
+  # have a Lambda read these objects to do the actual resume parsing.
+  # -------------------------------------------------------------------------
+  UploadsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-${Environment}-uploads-${AWS::AccountId}"
+
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+      # Cost hygiene: a portfolio project doesn't need to keep every test
+      # upload forever. Any object (regardless of prefix) is deleted 90
+      # days after it was uploaded. Applications/resumes a user still cares
+      # about would, in a real product, be re-uploaded or copied somewhere
+      # durable before this fires - for Phase 2 we just want the bucket to
+      # not grow unbounded while we iterate.
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireAfter90Days
+            Status: Enabled
+            ExpirationInDays: 90
+
+      # The browser uploads directly to S3 with a PUT request (that's the
+      # point of a presigned URL - see api-stack.yaml). A cross-origin PUT
+      # from the CloudFront-hosted frontend (and from localhost while
+      # developing) needs the bucket's own CORS rule; API Gateway's CORS
+      # config in api-stack.yaml only covers calls to the API, not this
+      # direct-to-S3 call.
+      CorsConfiguration:
+        CorsRules:
+          - AllowedOrigins:
+              - Fn::Sub:
+                  - "https://${CloudFrontDomain}"
+                  - CloudFrontDomain:
+                      Fn::ImportValue: !Sub "${ProjectName}-${Environment}-CloudFrontDomainName"
+              - "http://localhost:5173"
+            AllowedMethods: [PUT, GET, HEAD]
+            AllowedHeaders: ["*"]
+            ExposedHeaders: [ETag]
+            MaxAge: 3000
+
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # -------------------------------------------------------------------------
+  # AWS::DynamoDB::Table - JobApplications
+  #
+  # One item per job description a user submits. Partition key userId groups
+  # every application by owner; sort key applicationId (a UUID) lets one
+  # user have many applications, and lets a Query fetch "all applications
+  # for this user" as a single efficient operation (see the list-applications
+  # Lambda in api-stack.yaml) instead of scanning the whole table.
+  #
+  # BillingMode PAY_PER_REQUEST = "on-demand": DynamoDB scales read/write
+  # throughput automatically and you pay per request made, with no capacity
+  # to plan ahead of time. The alternative, PROVISIONED, means declaring a
+  # fixed read/write capacity up front (cheaper at steady high volume, but
+  # you pay for it whether traffic shows up or not, and under-provisioning
+  # causes throttling). For a portfolio app with unpredictable, low traffic,
+  # on-demand means zero cost when nobody's using it and no capacity math.
+  # -------------------------------------------------------------------------
+  JobApplicationsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: JobApplications
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: applicationId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+        - AttributeName: applicationId
+          KeyType: RANGE
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # -------------------------------------------------------------------------
+  # AWS::DynamoDB::Table - UserProfiles
+  #
+  # One item per user (partition key userId, no sort key - a single row per
+  # user is all we need). Holds profile-level state that isn't tied to any
+  # one application, starting with currentResumeS3Key (set by the
+  # presigned-url Lambda once an upload completes).
+  # -------------------------------------------------------------------------
+  UserProfilesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: UserProfiles
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # -------------------------------------------------------------------------
+  # AWS::S3::Bucket - deployment artifacts (Phase 3+).
+  #
+  # Every Lambda so far has shipped as inline `ZipFile` code directly in its
+  # CloudFormation template - fine up to CloudFormation's 4096-character
+  # limit on that property, but the Phase 3 processing Lambda (Textract call,
+  # matching algorithm, AI fallback, error handling) is well past it. The
+  # real alternative is `aws cloudformation package`: it zips a local source
+  # file/directory, uploads the zip here, and rewrites the template to point
+  # at that upload before deploying - this bucket is only that upload
+  # target, nothing reads from it at runtime. deploy-infra.sh runs `package`
+  # for processing-stack.yaml before deploying it.
+  # -------------------------------------------------------------------------
+  DeploymentArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-${Environment}-deploy-artifacts-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      # Cost hygiene, same reasoning as the uploads bucket: nobody needs a
+      # zip from a deploy three months ago once a newer one has replaced it.
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldArtifactsAfter30Days
+            Status: Enabled
+            ExpirationInDays: 30
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+Outputs:
+  UploadsBucketName:
+    Value: !Ref UploadsBucket
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-UploadsBucketName"
+
+  UploadsBucketArn:
+    Value: !GetAtt UploadsBucket.Arn
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-UploadsBucketArn"
+
+  JobApplicationsTableName:
+    Value: !Ref JobApplicationsTable
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-JobApplicationsTableName"
+
+  JobApplicationsTableArn:
+    Value: !GetAtt JobApplicationsTable.Arn
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-JobApplicationsTableArn"
+
+  UserProfilesTableName:
+    Value: !Ref UserProfilesTable
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-UserProfilesTableName"
+
+  UserProfilesTableArn:
+    Value: !GetAtt UserProfilesTable.Arn
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-UserProfilesTableArn"
+
+  DeploymentArtifactsBucketName:
+    Description: Upload target for `aws cloudformation package` (deploy-infra.sh uses this).
+    Value: !Ref DeploymentArtifactsBucket
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-DeploymentArtifactsBucketName"

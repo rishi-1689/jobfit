@@ -1,0 +1,953 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >
+  JobFit Copilot - Phase 2 - API stack.
+  An HTTP API in front of three Lambda functions (presigned resume upload,
+  create application, list applications), secured by a Cognito JWT
+  authorizer so every route only ever sees an authenticated user's own data.
+
+# ---------------------------------------------------------------------------
+# HTTP API vs REST API: API Gateway offers two products under one console.
+# "REST API" (AWS::ApiGateway::*) is the original, feature-rich but verbose
+# and pricier option. "HTTP API" (AWS::ApiGatewayV2::*, used below) is a
+# newer, cheaper (~70% less), lower-latency option covering the common case:
+# route requests to a Lambda, authorize with a JWT. It's the default choice
+# unless you need REST API's extras (request/response transformation,
+# usage plans/API keys, WAF, private VPC endpoints). This app doesn't, so
+# HTTP API it is.
+# ---------------------------------------------------------------------------
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: jobfit-copilot
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365]
+    Description: >
+      How long each Lambda's CloudWatch Logs are kept. Without an explicit
+      log group (see the *LogGroup resources below), Lambda auto-creates one
+      on first invocation with NEVER EXPIRE retention - logs then accumulate,
+      and get billed for, forever. Declaring the log group ourselves is the
+      only way to set retention on it.
+
+  DefaultApplicationQuota:
+    Type: Number
+    Default: 10
+    Description: >
+      How many job descriptions a user may submit before create-application
+      starts rejecting with 429, UNLESS an admin has set a different
+      applicationQuota directly on that user's UserProfiles row via
+      /admin. A per-user override always wins over this default.
+
+Resources:
+  # -------------------------------------------------------------------------
+  # AWS::ApiGatewayV2::Api - the HTTP API itself.
+  #
+  # CorsConfiguration here handles preflight (OPTIONS) requests for calls
+  # made *to this API* from the browser - API Gateway answers them itself,
+  # no Lambda invoked. (This is separate from the S3 bucket's own CORS rule
+  # in storage-stack.yaml, which covers the browser's direct PUT to S3.)
+  # -------------------------------------------------------------------------
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub "${ProjectName}-${Environment}-api"
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins:
+          - Fn::Sub:
+              - "https://${CloudFrontDomain}"
+              - CloudFrontDomain:
+                  Fn::ImportValue: !Sub "${ProjectName}-${Environment}-CloudFrontDomainName"
+          - "http://localhost:5173"
+        AllowMethods: [GET, POST, PUT, DELETE, OPTIONS]
+        AllowHeaders: [Content-Type, Authorization]
+        MaxAge: 300
+
+  # -------------------------------------------------------------------------
+  # AWS::ApiGatewayV2::Stage - "$default" auto-deploys, meaning every change
+  # to routes/integrations goes live immediately with no separate "deploy"
+  # step, and the invoke URL has no stage suffix
+  # (https://<api-id>.execute-api.<region>.amazonaws.com/ instead of .../dev).
+  # -------------------------------------------------------------------------
+  DefaultStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: "$default"
+      AutoDeploy: true
+
+  # -------------------------------------------------------------------------
+  # AWS::ApiGatewayV2::Authorizer - a JWT authorizer.
+  #
+  # This runs *before* a request reaches any Lambda: API Gateway pulls the
+  # JWT out of the Authorization header, verifies its signature against the
+  # User Pool's public keys, checks it hasn't expired, and checks its
+  # Audience claim matches ClientId below - all without a single line of
+  # our code. A request that fails any check gets a 401 and never invokes a
+  # Lambda (that's what "least privilege" looks like at the network edge,
+  # not just in IAM). A request that passes has its verified claims (userId,
+  # etc.) handed to the Lambda in event.requestContext.authorizer.jwt.claims.
+  #
+  # Audience is checked against the Cognito Access Token's client_id claim
+  # here (API Gateway special-cases Cognito tokens, which don't carry a
+  # standard "aud" claim on access tokens) - the frontend sends the access
+  # token, not the ID token, because "authorizing an API call" is exactly
+  # what an OAuth access token is for.
+  # -------------------------------------------------------------------------
+  CognitoAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      ApiId: !Ref HttpApi
+      AuthorizerType: JWT
+      Name: CognitoUserPoolAuthorizer
+      IdentitySource:
+        - "$request.header.Authorization"
+      JwtConfiguration:
+        Audience:
+          - Fn::ImportValue: !Sub "${ProjectName}-${Environment}-UserPoolClientId"
+        Issuer:
+          Fn::Sub:
+            - "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPoolId}"
+            - UserPoolId:
+                Fn::ImportValue: !Sub "${ProjectName}-${Environment}-UserPoolId"
+
+  # =========================================================================
+  # POST /resumes/presigned-url
+  # =========================================================================
+
+  # ---------------------------------------------------------------------
+  # A presigned URL is a normal S3 URL with a temporary, cryptographic
+  # signature baked into its query string, generated using this Lambda's
+  # own IAM credentials. Whoever holds that URL can perform exactly one
+  # action (here, PUT one specific object key) until it expires (300s
+  # below) - no AWS credentials of their own required. This lets the
+  # browser upload the file bytes straight to S3, instead of routing them
+  # through Lambda/API Gateway (which caps request bodies at 10 MB on HTTP
+  # APIs and would burn Lambda runtime just proxying bytes). The Lambda's
+  # job is only to decide *whether* this user may upload and *what key*
+  # they're allowed to write to - never to see the file itself.
+  # ---------------------------------------------------------------------
+  PresignedUrlFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-${Environment}-presigned-url"
+      Runtime: nodejs20.x
+      Handler: index.handler
+      Timeout: 10
+      Role: !GetAtt PresignedUrlFunctionRole.Arn
+      Environment:
+        Variables:
+          UPLOADS_BUCKET:
+            Fn::ImportValue: !Sub "${ProjectName}-${Environment}-UploadsBucketName"
+          PROFILES_TABLE:
+            Fn::ImportValue: !Sub "${ProjectName}-${Environment}-UserProfilesTableName"
+      Code:
+        ZipFile: |
+          // Inline ZipFile code has no package.json (so no "type": "module"),
+          // and a plain .js file is CommonJS by default - hence require/
+          // exports.handler here instead of import/export.
+          const { S3Client, PutObjectCommand } = require("@aws-sdk/client-s3");
+          const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
+          const { DynamoDBClient, UpdateItemCommand } = require("@aws-sdk/client-dynamodb");
+          const { randomUUID } = require("crypto");
+
+          const s3 = new S3Client({});
+          const ddb = new DynamoDBClient({});
+          const BUCKET = process.env.UPLOADS_BUCKET;
+          const PROFILES_TABLE = process.env.PROFILES_TABLE;
+
+          exports.handler = async (event) => {
+            const userId = event.requestContext.authorizer.jwt.claims.sub;
+            let body = {};
+            try { body = JSON.parse(event.body || "{}"); } catch {}
+
+            const fileName = (body.fileName || "resume.pdf").replace(/[^\w.\-]/g, "_");
+            const contentType = body.contentType || "application/octet-stream";
+            const key = `resumes/${userId}/${randomUUID()}-${fileName}`;
+
+            const uploadUrl = await getSignedUrl(
+              s3,
+              new PutObjectCommand({ Bucket: BUCKET, Key: key, ContentType: contentType }),
+              { expiresIn: 300 }
+            );
+
+            await ddb.send(new UpdateItemCommand({
+              TableName: PROFILES_TABLE,
+              Key: { userId: { S: userId } },
+              UpdateExpression: "SET currentResumeS3Key = :k, updatedAt = :t",
+              ExpressionAttributeValues: {
+                ":k": { S: key },
+                ":t": { S: new Date().toISOString() },
+              },
+            }));
+
+            return {
+              statusCode: 200,
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ uploadUrl, key }),
+            };
+          };
+
+  # AWS::Logs::LogGroup - claims ownership of this function's log group
+  # ahead of time, purely to set RetentionInDays on it. The name MUST match
+  # exactly what Lambda would auto-create (/aws/lambda/<function name>), or
+  # CloudFormation creates a second, unused log group alongside the real one.
+  PresignedUrlLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-${Environment}-presigned-url"
+      RetentionInDays: !Ref LogRetentionDays
+
+  # Least-privilege role: this function may write objects only under
+  # resumes/* in the uploads bucket, and may only UpdateItem (never Scan,
+  # Query, Delete, ...) on UserProfiles.
+  PresignedUrlFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-${Environment}-presigned-url-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: PresignedUrlAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource:
+                  Fn::Sub:
+                    - "${BucketArn}/resumes/*"
+                    - BucketArn:
+                        Fn::ImportValue: !Sub "${ProjectName}-${Environment}-UploadsBucketArn"
+              - Effect: Allow
+                Action: dynamodb:UpdateItem
+                Resource:
+                  Fn::ImportValue: !Sub "${ProjectName}-${Environment}-UserProfilesTableArn"
+
+  PresignedUrlPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PresignedUrlFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/POST/resumes/presigned-url"
+
+  PresignedUrlIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${PresignedUrlFunction.Arn}/invocations"
+      PayloadFormatVersion: "2.0"
+
+  PresignedUrlRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "POST /resumes/presigned-url"
+      AuthorizationType: JWT
+      AuthorizerId: !Ref CognitoAuthorizer
+      Target: !Sub "integrations/${PresignedUrlIntegration}"
+
+  # =========================================================================
+  # POST /applications
+  # =========================================================================
+
+  CreateApplicationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-${Environment}-create-application"
+      Runtime: nodejs20.x
+      Handler: index.handler
+      Timeout: 10
+      Role: !GetAtt CreateApplicationFunctionRole.Arn
+      Environment:
+        Variables:
+          APPLICATIONS_TABLE:
+            Fn::ImportValue: !Sub "${ProjectName}-${Environment}-JobApplicationsTableName"
+          PROFILES_TABLE:
+            Fn::ImportValue: !Sub "${ProjectName}-${Environment}-UserProfilesTableName"
+          PROCESSING_QUEUE_URL:
+            Fn::ImportValue: !Sub "${ProjectName}-${Environment}-ApplicationProcessingQueueUrl"
+          DEFAULT_QUOTA: !Ref DefaultApplicationQuota
+      Code:
+        ZipFile: |
+          const { DynamoDBClient, PutItemCommand, UpdateItemCommand } = require("@aws-sdk/client-dynamodb");
+          const { SQSClient, SendMessageCommand } = require("@aws-sdk/client-sqs");
+          const { randomUUID } = require("crypto");
+
+          const ddb = new DynamoDBClient({});
+          const sqs = new SQSClient({});
+          const TABLE = process.env.APPLICATIONS_TABLE;
+          const PROFILES_TABLE = process.env.PROFILES_TABLE;
+          const QUEUE_URL = process.env.PROCESSING_QUEUE_URL;
+          const DEFAULT_QUOTA = process.env.DEFAULT_QUOTA;
+
+          exports.handler = async (event) => {
+            const userId = event.requestContext.authorizer.jwt.claims.sub;
+            let body = {};
+            try { body = JSON.parse(event.body || "{}"); } catch {}
+
+            const jobDescription = (body.jobDescription || "").trim().slice(0, 20000);
+            if (!jobDescription) {
+              return {
+                statusCode: 400,
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ message: "jobDescription is required" }),
+              };
+            }
+
+            // Atomic check-and-increment against the SAME item, so there's
+            // no separate read-then-write race. If neither attribute exists
+            // yet (first-ever submission for this user), the condition
+            // passes and this call also seeds them - every submission after
+            // that is checked against a real count/quota pair. A per-user
+            // quota set via /admin overrides DEFAULT_QUOTA automatically,
+            // since it's just a plain attribute comparison here.
+            try {
+              await ddb.send(new UpdateItemCommand({
+                TableName: PROFILES_TABLE,
+                Key: { userId: { S: userId } },
+                UpdateExpression: "SET applicationCount = if_not_exists(applicationCount, :zero) + :one, applicationQuota = if_not_exists(applicationQuota, :defaultQuota)",
+                ConditionExpression: "attribute_not_exists(applicationCount) OR attribute_not_exists(applicationQuota) OR applicationCount < applicationQuota",
+                ExpressionAttributeValues: {
+                  ":zero": { N: "0" },
+                  ":one": { N: "1" },
+                  ":defaultQuota": { N: DEFAULT_QUOTA },
+                },
+              }));
+            } catch (err) {
+              if (err.name === "ConditionalCheckFailedException") {
+                return {
+                  statusCode: 429,
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ message: "You've reached your job description submission limit. Ask the admin to raise it." }),
+                };
+              }
+              throw err;
+            }
+
+            const applicationId = randomUUID();
+            const createdAt = new Date().toISOString();
+
+            await ddb.send(new PutItemCommand({
+              TableName: TABLE,
+              Item: {
+                userId: { S: userId },
+                applicationId: { S: applicationId },
+                jobDescription: { S: jobDescription },
+                status: { S: "PENDING" },
+                createdAt: { S: createdAt },
+              },
+            }));
+
+            // Publish, don't process inline: this handler's job is "accept
+            // the request fast", not "do the matching". The processing
+            // Lambda (processing-stack.yaml) picks this up asynchronously.
+            await sqs.send(new SendMessageCommand({
+              QueueUrl: QUEUE_URL,
+              MessageBody: JSON.stringify({ userId, applicationId, jobDescription }),
+            }));
+
+            return {
+              statusCode: 201,
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ applicationId, status: "PENDING", createdAt }),
+            };
+          };
+
+  CreateApplicationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-${Environment}-create-application"
+      RetentionInDays: !Ref LogRetentionDays
+
+  # Least-privilege role: PutItem on JobApplications, UpdateItem on
+  # UserProfiles (quota check-and-increment only - it can't Query/Scan/
+  # Delete either table), plus SendMessage on exactly the one queue it
+  # publishes to (processing-stack.yaml) - it can't ReceiveMessage/
+  # DeleteMessage/read the DLQ or touch anything else.
+  CreateApplicationFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-${Environment}-create-application-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CreateApplicationAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: dynamodb:PutItem
+                Resource:
+                  Fn::ImportValue: !Sub "${ProjectName}-${Environment}-JobApplicationsTableArn"
+              - Effect: Allow
+                Action: dynamodb:UpdateItem
+                Resource:
+                  Fn::ImportValue: !Sub "${ProjectName}-${Environment}-UserProfilesTableArn"
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource:
+                  Fn::ImportValue: !Sub "${ProjectName}-${Environment}-ApplicationProcessingQueueArn"
+
+  CreateApplicationPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CreateApplicationFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/POST/applications"
+
+  CreateApplicationIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${CreateApplicationFunction.Arn}/invocations"
+      PayloadFormatVersion: "2.0"
+
+  CreateApplicationRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "POST /applications"
+      AuthorizationType: JWT
+      AuthorizerId: !Ref CognitoAuthorizer
+      Target: !Sub "integrations/${CreateApplicationIntegration}"
+
+  # =========================================================================
+  # GET /applications
+  # =========================================================================
+
+  ListApplicationsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-${Environment}-list-applications"
+      Runtime: nodejs20.x
+      Handler: index.handler
+      Timeout: 10
+      Role: !GetAtt ListApplicationsFunctionRole.Arn
+      Environment:
+        Variables:
+          APPLICATIONS_TABLE:
+            Fn::ImportValue: !Sub "${ProjectName}-${Environment}-JobApplicationsTableName"
+      Code:
+        ZipFile: |
+          const { DynamoDBClient, QueryCommand } = require("@aws-sdk/client-dynamodb");
+
+          const ddb = new DynamoDBClient({});
+          const TABLE = process.env.APPLICATIONS_TABLE;
+
+          exports.handler = async (event) => {
+            const userId = event.requestContext.authorizer.jwt.claims.sub;
+
+            // Query, not Scan: reads only this user's partition (userId),
+            // never the whole table - cheaper, faster, and it's what makes
+            // "only see your own applications" true at the data layer, not
+            // just in the UI.
+            const result = await ddb.send(new QueryCommand({
+              TableName: TABLE,
+              KeyConditionExpression: "userId = :u",
+              ExpressionAttributeValues: { ":u": { S: userId } },
+              ScanIndexForward: false,
+            }));
+
+            const items = (result.Items || []).map((i) => ({
+              applicationId: i.applicationId.S,
+              jobDescription: i.jobDescription.S,
+              status: i.status.S,
+              createdAt: i.createdAt.S,
+              // Only present once the processing Lambda has finished (or
+              // failed) - undefined while PENDING/PROCESSING.
+              matchScore: i.matchScore ? Number(i.matchScore.N) : undefined,
+              gapAnalysis: i.gapAnalysis ? i.gapAnalysis.L.map((g) => g.S) : undefined,
+              coverLetterS3Key: i.coverLetterS3Key ? i.coverLetterS3Key.S : undefined,
+              errorMessage: i.errorMessage ? i.errorMessage.S : undefined,
+            }));
+
+            return {
+              statusCode: 200,
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ items }),
+            };
+          };
+
+  ListApplicationsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-${Environment}-list-applications"
+      RetentionInDays: !Ref LogRetentionDays
+
+  # Least-privilege role: Query only, only on JobApplications.
+  ListApplicationsFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-${Environment}-list-applications-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ListApplicationsAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: dynamodb:Query
+                Resource:
+                  Fn::ImportValue: !Sub "${ProjectName}-${Environment}-JobApplicationsTableArn"
+
+  ListApplicationsPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ListApplicationsFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/GET/applications"
+
+  ListApplicationsIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ListApplicationsFunction.Arn}/invocations"
+      PayloadFormatVersion: "2.0"
+
+  ListApplicationsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "GET /applications"
+      AuthorizationType: JWT
+      AuthorizerId: !Ref CognitoAuthorizer
+      Target: !Sub "integrations/${ListApplicationsIntegration}"
+
+  # =========================================================================
+  # DELETE /applications/{applicationId}
+  # =========================================================================
+
+  DeleteApplicationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-${Environment}-delete-application"
+      Runtime: nodejs20.x
+      Handler: index.handler
+      Timeout: 10
+      Role: !GetAtt DeleteApplicationFunctionRole.Arn
+      Environment:
+        Variables:
+          APPLICATIONS_TABLE:
+            Fn::ImportValue: !Sub "${ProjectName}-${Environment}-JobApplicationsTableName"
+          UPLOADS_BUCKET:
+            Fn::ImportValue: !Sub "${ProjectName}-${Environment}-UploadsBucketName"
+      Code:
+        ZipFile: |
+          const { DynamoDBClient, DeleteItemCommand } = require("@aws-sdk/client-dynamodb");
+          const { S3Client, DeleteObjectCommand } = require("@aws-sdk/client-s3");
+
+          const ddb = new DynamoDBClient({});
+          const s3 = new S3Client({});
+          const TABLE = process.env.APPLICATIONS_TABLE;
+          const BUCKET = process.env.UPLOADS_BUCKET;
+
+          exports.handler = async (event) => {
+            const userId = event.requestContext.authorizer.jwt.claims.sub;
+            const applicationId = event.pathParameters && event.pathParameters.applicationId;
+            if (!applicationId) {
+              return { statusCode: 400, body: JSON.stringify({ message: "applicationId is required" }) };
+            }
+
+            await ddb.send(new DeleteItemCommand({
+              TableName: TABLE,
+              Key: { userId: { S: userId }, applicationId: { S: applicationId } },
+            }));
+
+            // Best-effort cleanup: deleting a key that doesn't exist isn't
+            // an error, so this is safe even if no cover letter was ever
+            // generated for this application.
+            await s3.send(new DeleteObjectCommand({
+              Bucket: BUCKET,
+              Key: `cover-letters/${userId}/${applicationId}.txt`,
+            })).catch((err) => console.error("Cover letter cleanup failed (non-fatal):", err));
+
+            return { statusCode: 204, body: "" };
+          };
+
+  DeleteApplicationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-${Environment}-delete-application"
+      RetentionInDays: !Ref LogRetentionDays
+
+  # Least-privilege role: DeleteItem on JobApplications, DeleteObject scoped
+  # only to cover-letters/* (never resumes/*).
+  DeleteApplicationFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-${Environment}-delete-application-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DeleteApplicationAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: dynamodb:DeleteItem
+                Resource:
+                  Fn::ImportValue: !Sub "${ProjectName}-${Environment}-JobApplicationsTableArn"
+              - Effect: Allow
+                Action: s3:DeleteObject
+                Resource:
+                  Fn::Sub:
+                    - "${BucketArn}/cover-letters/*"
+                    - BucketArn:
+                        Fn::ImportValue: !Sub "${ProjectName}-${Environment}-UploadsBucketArn"
+
+  DeleteApplicationPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DeleteApplicationFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/DELETE/applications/*"
+
+  DeleteApplicationIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DeleteApplicationFunction.Arn}/invocations"
+      PayloadFormatVersion: "2.0"
+
+  DeleteApplicationRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "DELETE /applications/{applicationId}"
+      AuthorizationType: JWT
+      AuthorizerId: !Ref CognitoAuthorizer
+      Target: !Sub "integrations/${DeleteApplicationIntegration}"
+
+  # =========================================================================
+  # PUT /applications/{applicationId}
+  # =========================================================================
+
+  UpdateApplicationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-${Environment}-update-application"
+      Runtime: nodejs20.x
+      Handler: index.handler
+      Timeout: 10
+      Role: !GetAtt UpdateApplicationFunctionRole.Arn
+      Environment:
+        Variables:
+          APPLICATIONS_TABLE:
+            Fn::ImportValue: !Sub "${ProjectName}-${Environment}-JobApplicationsTableName"
+          PROCESSING_QUEUE_URL:
+            Fn::ImportValue: !Sub "${ProjectName}-${Environment}-ApplicationProcessingQueueUrl"
+      Code:
+        ZipFile: |
+          const { DynamoDBClient, UpdateItemCommand } = require("@aws-sdk/client-dynamodb");
+          const { SQSClient, SendMessageCommand } = require("@aws-sdk/client-sqs");
+
+          const ddb = new DynamoDBClient({});
+          const sqs = new SQSClient({});
+          const TABLE = process.env.APPLICATIONS_TABLE;
+          const QUEUE_URL = process.env.PROCESSING_QUEUE_URL;
+
+          exports.handler = async (event) => {
+            const userId = event.requestContext.authorizer.jwt.claims.sub;
+            const applicationId = event.pathParameters && event.pathParameters.applicationId;
+            if (!applicationId) {
+              return { statusCode: 400, body: JSON.stringify({ message: "applicationId is required" }) };
+            }
+
+            let body = {};
+            try { body = JSON.parse(event.body || "{}"); } catch {}
+            const jobDescription = (body.jobDescription || "").trim().slice(0, 20000);
+            if (!jobDescription) {
+              return { statusCode: 400, body: JSON.stringify({ message: "jobDescription is required" }) };
+            }
+
+            try {
+              // attribute_exists guards against UpdateItem's default upsert
+              // behavior - without it, "editing" a made-up applicationId
+              // would silently CREATE a new, incomplete row instead of
+              // failing with a 404.
+              await ddb.send(new UpdateItemCommand({
+                TableName: TABLE,
+                Key: { userId: { S: userId }, applicationId: { S: applicationId } },
+                ConditionExpression: "attribute_exists(applicationId)",
+                UpdateExpression: "SET jobDescription = :jd, #s = :pending REMOVE matchScore, gapAnalysis, coverLetterS3Key, errorMessage",
+                ExpressionAttributeNames: { "#s": "status" },
+                ExpressionAttributeValues: {
+                  ":jd": { S: jobDescription },
+                  ":pending": { S: "PENDING" },
+                },
+              }));
+            } catch (err) {
+              if (err.name === "ConditionalCheckFailedException") {
+                return { statusCode: 404, headers: { "Content-Type": "application/json" }, body: JSON.stringify({ message: "Application not found" }) };
+              }
+              throw err;
+            }
+
+            // Re-queue for processing against the new text, same as a
+            // fresh submission - old matchScore/gapAnalysis/cover letter
+            // are now stale and were just cleared above.
+            await sqs.send(new SendMessageCommand({
+              QueueUrl: QUEUE_URL,
+              MessageBody: JSON.stringify({ userId, applicationId, jobDescription }),
+            }));
+
+            return {
+              statusCode: 200,
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ applicationId, status: "PENDING" }),
+            };
+          };
+
+  UpdateApplicationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-${Environment}-update-application"
+      RetentionInDays: !Ref LogRetentionDays
+
+  # Least-privilege role: UpdateItem on JobApplications, SendMessage only on
+  # the processing queue.
+  UpdateApplicationFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-${Environment}-update-application-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: UpdateApplicationAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: dynamodb:UpdateItem
+                Resource:
+                  Fn::ImportValue: !Sub "${ProjectName}-${Environment}-JobApplicationsTableArn"
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource:
+                  Fn::ImportValue: !Sub "${ProjectName}-${Environment}-ApplicationProcessingQueueArn"
+
+  UpdateApplicationPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref UpdateApplicationFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/PUT/applications/*"
+
+  UpdateApplicationIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UpdateApplicationFunction.Arn}/invocations"
+      PayloadFormatVersion: "2.0"
+
+  UpdateApplicationRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "PUT /applications/{applicationId}"
+      AuthorizationType: JWT
+      AuthorizerId: !Ref CognitoAuthorizer
+      Target: !Sub "integrations/${UpdateApplicationIntegration}"
+
+  # =========================================================================
+  # /admin/* - one consolidated Lambda, five routes
+  #
+  # Same JWT authorizer as every other route (so an unauthenticated request
+  # still never reaches a Lambda), but the Lambda itself additionally checks
+  # the token's `cognito:groups` claim for "Admins" - an authorization
+  # decision HTTP API JWT authorizers can't make for us, since they only
+  # validate the token, not what it entitles its holder to do. See
+  # backend/lambdas/admin/index.js and auth-stack.yaml's AdminsGroup.
+  #
+  # Code points at a LOCAL directory, like processing-stack.yaml's
+  # processor: deploy-infra.sh runs `aws cloudformation package` on this
+  # template first, which zips it, uploads it to the
+  # DeploymentArtifactsBucket, and rewrites this property before `deploy`.
+  # =========================================================================
+
+  AdminFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: AdminLogGroup
+    Properties:
+      FunctionName: !Sub "${ProjectName}-${Environment}-admin"
+      Runtime: nodejs20.x
+      Handler: index.handler
+      Timeout: 15
+      Role: !GetAtt AdminFunctionRole.Arn
+      Code: ../../backend/lambdas/admin
+      Environment:
+        Variables:
+          PROFILES_TABLE:
+            Fn::ImportValue: !Sub "${ProjectName}-${Environment}-UserProfilesTableName"
+          USER_POOL_ID:
+            Fn::ImportValue: !Sub "${ProjectName}-${Environment}-UserPoolId"
+          AI_API_KEY_PARAM: /jobfit/ai-api-key
+          USE_LIVE_AI_PARAM: /jobfit/use-live-ai
+          DEFAULT_QUOTA: !Ref DefaultApplicationQuota
+
+  AdminLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-${Environment}-admin"
+      RetentionInDays: !Ref LogRetentionDays
+
+  # Scoped to exactly what the five routes need, each to its specific
+  # resource: the two SSM parameters by name, the one table, the one user
+  # pool. Never ssm:GetParameter WITH decryption - the API key is
+  # write-only through this function, nothing here ever reads it back.
+  AdminFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-${Environment}-admin-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AdminAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:PutParameter
+                Resource:
+                  - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/jobfit/ai-api-key"
+                  - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/jobfit/use-live-ai"
+              - Effect: Allow
+                Action:
+                  - dynamodb:Scan
+                  - dynamodb:UpdateItem
+                Resource:
+                  Fn::ImportValue: !Sub "${ProjectName}-${Environment}-UserProfilesTableArn"
+              - Effect: Allow
+                Action: cognito-idp:ListUsers
+                Resource:
+                  Fn::ImportValue: !Sub "${ProjectName}-${Environment}-UserPoolArn"
+
+  # One permission covers all five routes - they all invoke the same
+  # function, and "/*/*/admin/*" matches any stage, any method, any path
+  # under /admin/ (including the {userId} path parameter route).
+  AdminPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AdminFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*/admin/*"
+
+  AdminIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AdminFunction.Arn}/invocations"
+      PayloadFormatVersion: "2.0"
+
+  AdminGetSettingsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "GET /admin/settings"
+      AuthorizationType: JWT
+      AuthorizerId: !Ref CognitoAuthorizer
+      Target: !Sub "integrations/${AdminIntegration}"
+
+  AdminPutSettingsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "PUT /admin/settings"
+      AuthorizationType: JWT
+      AuthorizerId: !Ref CognitoAuthorizer
+      Target: !Sub "integrations/${AdminIntegration}"
+
+  AdminPutApiKeyRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "PUT /admin/api-key"
+      AuthorizationType: JWT
+      AuthorizerId: !Ref CognitoAuthorizer
+      Target: !Sub "integrations/${AdminIntegration}"
+
+  AdminGetUsersRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "GET /admin/users"
+      AuthorizationType: JWT
+      AuthorizerId: !Ref CognitoAuthorizer
+      Target: !Sub "integrations/${AdminIntegration}"
+
+  AdminPutUserQuotaRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "PUT /admin/users/{userId}/quota"
+      AuthorizationType: JWT
+      AuthorizerId: !Ref CognitoAuthorizer
+      Target: !Sub "integrations/${AdminIntegration}"
+
+Outputs:
+  ApiEndpoint:
+    Description: Base URL the frontend calls (frontend env var VITE_API_ENDPOINT).
+    Value: !GetAtt HttpApi.ApiEndpoint
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-ApiEndpoint"

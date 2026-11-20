@@ -1,0 +1,252 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >
+  JobFit Copilot - Phase 3 - Async processing stack.
+  An SQS queue (with a dead-letter queue) decouples "accept a job
+  description" from "actually match it against a resume" - create-application
+  (api-stack.yaml) publishes to this queue instead of doing the work inline,
+  and the Lambda here does the matching asynchronously.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: jobfit-copilot
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365]
+
+Resources:
+  # -------------------------------------------------------------------------
+  # AWS::SQS::Queue - the dead-letter queue.
+  #
+  # A DLQ is just a normal queue that OTHER queues redirect permanently-
+  # failing messages into, instead of retrying them forever or silently
+  # dropping them. Nothing reads this automatically - a message landing here
+  # means "this application failed to process 3 times in a row" and is
+  # sitting here for a human to look at (CloudWatch metrics, or a manual
+  # `aws sqs receive-message` against it), not something the app currently
+  # acts on.
+  # -------------------------------------------------------------------------
+  ApplicationProcessingDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${ProjectName}-${Environment}-application-processing-dlq"
+      MessageRetentionPeriod: 1209600 # 14 days (SQS's maximum) - give plenty of time to notice and investigate
+
+  # -------------------------------------------------------------------------
+  # AWS::SQS::Queue - the primary queue.
+  #
+  # create-application (api-stack.yaml) publishes one message per submitted
+  # job description here; the processing Lambda below is subscribed to it.
+  #
+  # RedrivePolicy.maxReceiveCount: 3 - a message is redelivered (because the
+  # Lambda threw, or the visibility timeout expired mid-processing) up to
+  # 3 times before SQS moves it to the DLQ instead of retrying forever.
+  #
+  # VisibilityTimeout: AWS's own guidance for Lambda+SQS is to set this to
+  # AT LEAST 6x the function's timeout. The function's Timeout is 90s (see
+  # ProcessApplicationFunction below - it polls Amazon Textract's async API
+  # for multi-page PDFs, which needs real wall-clock time), so 540s here -
+  # if it were too short, a message could become visible again (and get
+  # redelivered to a second, overlapping invocation) WHILE the first
+  # invocation is still legitimately working on it.
+  # -------------------------------------------------------------------------
+  ApplicationProcessingQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${ProjectName}-${Environment}-application-processing"
+      VisibilityTimeout: 540
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ApplicationProcessingDLQ.Arn
+        maxReceiveCount: 3
+
+  # -------------------------------------------------------------------------
+  # /jobfit/ai-api-key and /jobfit/use-live-ai are deliberately NOT
+  # CloudFormation resources.
+  #
+  # Both are now runtime settings an admin changes from /admin (see
+  # api-stack.yaml's AdminFunction) without a redeploy - and CloudFormation
+  # is the wrong owner for anything that mutates outside of a deploy. If
+  # these were `AWS::SSM::Parameter` resources with a literal Value in the
+  # template (as the API key placeholder used to be, before /admin existed),
+  # a future template edit that touches either resource would make
+  # CloudFormation reassert ITS tracked Value, silently overwriting whatever
+  # the admin had set - the exact same class of bug that once wiped out the
+  # live Google sign-in config (see auth-stack.yaml's deploy history). The
+  # fix there was UsePreviousValue on a stack *parameter*; here there's no
+  # equivalent stack parameter at all to protect, since nothing about these
+  # two settings is decided at deploy time any more.
+  #
+  # Instead: `scripts/deploy-infra.sh` bootstraps both parameters with a
+  # plain `aws ssm put-parameter` (no --overwrite, so it's a no-op if they
+  # already exist) the first time only, and everything after that - reading
+  # them, changing them - happens through the app's own APIs. CloudFormation
+  # only ever grants IAM permission to the fixed parameter names below; it
+  # never declares or owns their values.
+  #
+  # (The other reason this template couldn't create the API key as a
+  # SecureString directly still applies too - AWS::SSM::Parameter has never
+  # supported that Type. AdminFunction's own ssm:PutParameter call can set
+  # Type: SecureString directly, since that's a real API capability - the
+  # gap was always in CloudFormation's resource type, not the service.)
+  # -------------------------------------------------------------------------
+
+  ProcessApplicationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-${Environment}-process-application"
+      RetentionInDays: !Ref LogRetentionDays
+
+  # -------------------------------------------------------------------------
+  # AWS::Lambda::Function - the processor.
+  #
+  # Code points at a LOCAL directory (backend/lambdas/process-application),
+  # not inline text - deploy-infra.sh runs `aws cloudformation package`
+  # first, which zips that directory, uploads it to the
+  # DeploymentArtifactsBucket (storage-stack.yaml), and rewrites this
+  # property to point at that upload before `deploy` ever sees it.
+  # -------------------------------------------------------------------------
+  ProcessApplicationFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: ProcessApplicationLogGroup
+    Properties:
+      FunctionName: !Sub "${ProjectName}-${Environment}-process-application"
+      Runtime: nodejs20.x
+      Handler: index.handler
+      # 90s, not the original 60s: extracting text from a real (multi-page)
+      # PDF now polls Amazon Textract's asynchronous API rather than a
+      # single synchronous call - see the comment on extractResumeText in
+      # backend/lambdas/process-application/index.js.
+      Timeout: 90
+      MemorySize: 512
+      Role: !GetAtt ProcessApplicationFunctionRole.Arn
+      Code: ../../backend/lambdas/process-application
+      Environment:
+        Variables:
+          UPLOADS_BUCKET:
+            Fn::ImportValue: !Sub "${ProjectName}-${Environment}-UploadsBucketName"
+          PROFILES_TABLE:
+            Fn::ImportValue: !Sub "${ProjectName}-${Environment}-UserProfilesTableName"
+          APPLICATIONS_TABLE:
+            Fn::ImportValue: !Sub "${ProjectName}-${Environment}-JobApplicationsTableName"
+          # Fixed, well-known parameter names, not references to a
+          # CloudFormation-managed resource - see the comment above on why
+          # these two settings aren't declared as stack resources.
+          AI_API_KEY_PARAM: /jobfit/ai-api-key
+          USE_LIVE_AI_PARAM: /jobfit/use-live-ai
+          MAX_RECEIVE_COUNT: "3"
+
+  # Least-privilege role. Two entries beyond what the spec for this Lambda
+  # named outright, both necessary for it to actually do its job:
+  #   - dynamodb:GetItem on UserProfiles - to find the resume S3 key
+  #     (currentResumeS3Key). Nothing else reaches this Lambda with that
+  #     key already attached, so it has to look it up itself.
+  #   - s3:GetObject on resumes/* - not called directly in code, but
+  #     Textract's DetectDocumentText reads the S3 object using the
+  #     CALLER's (this Lambda's) permissions, not its own - so this grant
+  #     is what lets Textract actually read the file.
+  ProcessApplicationFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-${Environment}-process-application-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ProcessApplicationAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # The Lambda SERVICE polls SQS using this role's permissions
+              # on our behalf (that's how EventSourceMapping works) - our
+              # code itself never calls these APIs directly.
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt ApplicationProcessingQueue.Arn
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource:
+                  Fn::Sub:
+                    - "${BucketArn}/resumes/*"
+                    - BucketArn:
+                        Fn::ImportValue: !Sub "${ProjectName}-${Environment}-UploadsBucketArn"
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource:
+                  Fn::Sub:
+                    - "${BucketArn}/cover-letters/*"
+                    - BucketArn:
+                        Fn::ImportValue: !Sub "${ProjectName}-${Environment}-UploadsBucketArn"
+              - Effect: Allow
+                Action: dynamodb:GetItem
+                Resource:
+                  Fn::ImportValue: !Sub "${ProjectName}-${Environment}-UserProfilesTableArn"
+              - Effect: Allow
+                Action: dynamodb:UpdateItem
+                Resource:
+                  Fn::ImportValue: !Sub "${ProjectName}-${Environment}-JobApplicationsTableArn"
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource:
+                  - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/jobfit/ai-api-key"
+                  - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/jobfit/use-live-ai"
+              # Textract API actions don't support resource-level ARNs (an
+              # AWS API limitation, not something scoped down here) - "*" is
+              # the tightest this can get. Start+Get (async, multi-page
+              # capable), not DetectDocumentText (sync, single-page only -
+              # rejects any real multi-page resume with
+              # UnsupportedDocumentException).
+              - Effect: Allow
+                Action:
+                  - textract:StartDocumentTextDetection
+                  - textract:GetDocumentTextDetection
+                Resource: "*"
+
+  # -------------------------------------------------------------------------
+  # AWS::Lambda::EventSourceMapping - subscribes the Lambda to the queue.
+  #
+  # BatchSize: 1 means one invocation handles exactly one message. Combined
+  # with the DLQ above, "3 failed attempts" maps directly onto "this one
+  # message was received 3 times without the Lambda completing successfully"
+  # - there's no batching complexity where one bad message could block
+  # others from being processed.
+  # -------------------------------------------------------------------------
+  ProcessApplicationEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt ApplicationProcessingQueue.Arn
+      FunctionName: !Ref ProcessApplicationFunction
+      BatchSize: 1
+      Enabled: true
+
+Outputs:
+  QueueUrl:
+    Description: Where create-application (api-stack.yaml) publishes new applications.
+    Value: !Ref ApplicationProcessingQueue
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-ApplicationProcessingQueueUrl"
+
+  QueueArn:
+    Value: !GetAtt ApplicationProcessingQueue.Arn
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-ApplicationProcessingQueueArn"
+
+  DeadLetterQueueUrl:
+    Value: !Ref ApplicationProcessingDLQ
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-ApplicationProcessingDLQUrl"

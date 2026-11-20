@@ -1,0 +1,23 @@
+node_modules
+dist
+.env
+.env.*
+!.env.example
+.DS_Store
+*.log
+
+# Leftovers from the unrelated old "moodboard" Flask app that shared this
+# folder. Anchored with a leading slash so they only match at the repo root.
+/app.py
+/instance/
+/static/
+/templates/
+/uploads/
+desktop.ini
+
+# Stale compiled copies of vite.config.ts (Vite would load the .js one first).
+/frontend/vite.config.js
+/frontend/vite.config.d.ts
+
+# Per-machine Claude Code settings (launch.json is shared and stays tracked).
+/.claude/settings.local.json
