@@ -56,3 +56,7 @@ See [docs/phase-1-deploy.md](docs/phase-1-deploy.md) for the original deploy
 walkthrough, [docs/architecture.md](docs/architecture.md) for how Phase 1-2
 fit together, and [docs/interview.md](docs/interview.md) for a fuller
 architecture writeup with the reasoning behind each decision.
+
+## License
+
+[MIT](LICENSE)
